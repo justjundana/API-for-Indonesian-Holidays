@@ -155,11 +155,7 @@ async fn scraper_data(year: i32) -> Result<Vec<Holiday>, Box<dyn std::error::Err
     ]);
 
     for ul in document.select(&ul_selector) {
-        let _year_str = ul
-            .select(&Selector::parse("li b").unwrap())
-            .next()
-            .map(|e| e.text().collect::<String>())
-            .unwrap_or_default();
+        let year_str = year.to_string();
 
         let month_str = ul
             .select(&Selector::parse("li a").unwrap())
@@ -172,11 +168,11 @@ async fn scraper_data(year: i32) -> Result<Vec<Holiday>, Box<dyn std::error::Err
             .replace(char::is_numeric, "")
             .trim()
             .to_string();
-        let _month_code = month_map.get(month.as_str()).unwrap_or(&"");
+        let month_code = month_map.get(month.as_str()).unwrap_or(&"");
 
         let tr_selector = Selector::parse("li:nth-child(4) tbody tr").unwrap();
         for tr in ul.select(&tr_selector) {
-            let date = tr
+            let day = tr
                 .select(&Selector::parse("td:first-child").unwrap())
                 .next()
                 .map(|e| e.text().collect::<String>())
@@ -188,8 +184,10 @@ async fn scraper_data(year: i32) -> Result<Vec<Holiday>, Box<dyn std::error::Err
                 .map(|e| e.text().collect::<String>())
                 .unwrap_or_default();
 
+            let full_date = format!("{}-{}-{}", year_str, month_code, day);
+
             data.push(HariLibur {
-                tanggal: date,
+                tanggal: full_date,
                 keterangan: description,
             });
         }
