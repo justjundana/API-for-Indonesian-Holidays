@@ -1,11 +1,14 @@
 use axum::{extract::Path, http::StatusCode, response::Json, routing::get, Router};
+use chrono::{Datelike, Local};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::{env, fs};
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    time::{sleep, Duration},
+};
 use uuid::Uuid;
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct HariLibur {
     tanggal: String,    // Original field name in Indonesian
@@ -43,6 +46,27 @@ async fn main() {
         .route("/", get(root))
         .route("/scrape/{year}", get(scrape_handler))
         .route("/libur/{year}", get(get_libur_handler));
+
+    // Run the periodic task to scrape on January 1st
+    tokio::spawn(async {
+        loop {
+            let now = Local::now();
+            // Check if the current date is January 1st
+            if now.month() == 1 && now.day() == 1 {
+                let year = now.year();
+
+                println!("Starting to scrape data for year {}", year);
+
+                match scraper_data(year).await {
+                    Ok(_) => println!("Data successfully scraped for year {}", year),
+                    Err(e) => eprintln!("Error scraping data: {}", e),
+                }
+            };
+
+            // Sleep for 24 hours
+            sleep(Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
 
     axum::serve(listener, app)
         .await
