@@ -1,237 +1,59 @@
-use axum::{extract::Path, http::StatusCode, response::Json, routing::get, Router};
-use chrono::{Datelike, Local};
-use scraper::{Html, Selector};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::{env, fs};
-use tokio::{
-    net::TcpListener,
-    time::{sleep, Duration},
+use calendar_indonesia::{
+    application::use_cases::{
+        get_holidays::GetHolidaysUseCase, scrape_holidays::ScrapeHolidaysUseCase,
+    },
+    config::Config,
+    infrastructure::{
+        external::scraper_service::WebScrapingService,
+        persistence::file_repository::FileHolidayRepository,
+        scheduler::holiday_scheduler::start_periodic_scraper,
+        web::routes::holiday_routes::create_routes,
+    },
 };
-use uuid::Uuid;
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct HariLibur {
-    tanggal: String,    // Original field name in Indonesian
-    keterangan: String, // Original field name in Indonesian
-}
-
-#[derive(Debug, Serialize)]
-struct Holiday {
-    date: String,         // Changed from `tanggal` to `date`
-    description: String,  // Changed from `keterangan` to `description`
-    is_joint_leave: bool, // New field to indicate joint leave
-}
-
-#[derive(Debug, Serialize)]
-struct ApiResponse<T> {
-    transaction_id: String,
-    code: i16,
-    message: String,
-    data: T,
-}
+use std::sync::Arc;
+use tokio::net::TcpListener;
 
 #[tokio::main]
-async fn main() {
-    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let host = env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let addr = format!("{}:{}", host, port);
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load configuration from environment variables (e.g., host and port)
+    let config = Config::from_env();
 
-    let listener = TcpListener::bind(&addr)
-        .await
-        .expect("Failed to bind to port");
+    // Print startup information to the console
+    println!("Starting Holiday API server...");
+    println!("Server will run at http://{}:{}", config.host, config.port);
 
-    println!("Server started at http://{}", addr);
+    // Setup the repository for storing holiday data (uses File-based storage)
+    let holiday_repository = Arc::new(FileHolidayRepository::new(config.data_dir.clone()));
 
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/scrape/{year}", get(scrape_handler))
-        .route("/libur/{year}", get(get_libur_handler));
+    // Setup the web scraping service to gather holidays from an external source
+    let scraping_service = Arc::new(WebScrapingService::new());
 
-    // Run the periodic task to scrape on January 1st
-    tokio::spawn(async {
-        loop {
-            let now = Local::now();
-            // Check if the current date is January 1st
-            if now.month() == 1 && now.day() == 1 {
-                let year = now.year();
+    // Setup use cases to interact with the repository and scraping service
+    let get_holidays_use_case = Arc::new(GetHolidaysUseCase::new(holiday_repository.clone()));
+    let scrape_holidays_use_case = Arc::new(ScrapeHolidaysUseCase::new(
+        holiday_repository.clone(),
+        scraping_service,
+    ));
 
-                println!("Starting to scrape data for year {}", year);
+    // Setup the Axum routes
+    let app = create_routes(get_holidays_use_case, scrape_holidays_use_case.clone());
 
-                match scraper_data(year).await {
-                    Ok(_) => println!("Data successfully scraped for year {}", year),
-                    Err(e) => eprintln!("Error scraping data: {}", e),
-                }
-            };
+    // Start a periodic scraper that will scrape holidays at scheduled intervals
+    start_periodic_scraper(scrape_holidays_use_case.clone()).await;
 
-            // Sleep for 24 hours
-            sleep(Duration::from_secs(24 * 60 * 60)).await;
-        }
-    });
+    // Start the server
+    let addr = format!("{}:{}", config.host, config.port);
+    let listener = TcpListener::bind(&addr).await?;
 
-    axum::serve(listener, app)
-        .await
-        .expect("Error serving application");
+    println!("🚀 Server started successfully at http://{}", addr);
+    println!("📚 Available endpoints:");
+    println!("   GET  /                     - Welcome message");
+    println!("   GET  /scrape/{{year}}        - Scrape holidays for a specific year");
+    println!("   GET  /libur/{{year}}         - Get holidays for a specific year");
+    println!("   GET  /libur/{{year}}/grouped - Get holidays for a specific year, grouped by type");
 
-    println!("Server running on port {}", port);
-}
+    // Serve the app
+    axum::serve(listener, app).await?;
 
-async fn root() -> &'static str {
-    "Welcome to the Holiday API"
-}
-
-async fn scrape_handler(
-    Path(year): Path<i32>,
-) -> Result<Json<ApiResponse<Vec<Holiday>>>, (StatusCode, String)> {
-    match scraper_data(year).await {
-        Ok(data) => {
-            let response = ApiResponse {
-                transaction_id: Uuid::new_v4().to_string(),
-                code: StatusCode::OK.as_u16() as i16,
-                message: "Data retrieved successfully".to_string(),
-                data,
-            };
-            Ok(Json(response))
-        }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
-}
-
-async fn get_libur_handler(
-    Path(year): Path<i32>,
-) -> Result<Json<ApiResponse<HashMap<String, Vec<Holiday>>>>, (StatusCode, String)> {
-    let filename = format!("data/{}.json", year);
-
-    match fs::read_to_string(&filename) {
-        Ok(contents) => {
-            let data: Vec<HariLibur> = serde_json::from_str(&contents)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-            let mut grouped_data: HashMap<String, Vec<Holiday>> = HashMap::new();
-            grouped_data.insert("joint_leave".to_string(), Vec::new());
-            grouped_data.insert("non_joint_leave".to_string(), Vec::new());
-
-            for holiday in data {
-                let is_joint_leave = holiday.keterangan.contains("Cuti Bersama");
-                let holiday_entry = Holiday {
-                    date: holiday.tanggal,
-                    description: holiday.keterangan.clone(),
-                    is_joint_leave,
-                };
-
-                if is_joint_leave {
-                    grouped_data
-                        .get_mut("joint_leave")
-                        .unwrap()
-                        .push(holiday_entry);
-                } else {
-                    grouped_data
-                        .get_mut("non_joint_leave")
-                        .unwrap()
-                        .push(holiday_entry);
-                }
-            }
-
-            let response = ApiResponse {
-                transaction_id: Uuid::new_v4().to_string(),
-                code: StatusCode::OK.as_u16() as i16,
-                message: "Data retrieved successfully".to_string(),
-                data: grouped_data,
-            };
-
-            Ok(Json(response))
-        }
-        Err(_) => {
-            let response = ApiResponse {
-                transaction_id: Uuid::new_v4().to_string(),
-                code: StatusCode::NOT_FOUND.as_u16() as i16,
-                message: "Data not found for the specified year".to_string(),
-                data: String::new(),
-            };
-
-            Err((
-                StatusCode::NOT_FOUND,
-                serde_json::to_string(&response).unwrap(),
-            ))
-        }
-    }
-}
-
-async fn scraper_data(year: i32) -> Result<Vec<Holiday>, Box<dyn std::error::Error>> {
-    let url = format!("https://www.tanggalan.com/{}", year);
-    let response = reqwest::get(&url).await?.text().await?;
-    let document = Html::parse_document(&response);
-    let ul_selector = Selector::parse("article ul").unwrap();
-    let mut data: Vec<HariLibur> = Vec::new();
-
-    let month_map: HashMap<&str, &str> = HashMap::from([
-        ("januari", "01"),
-        ("februari", "02"),
-        ("maret", "03"),
-        ("april", "04"),
-        ("mei", "05"),
-        ("juni", "06"),
-        ("juli", "07"),
-        ("agustus", "08"),
-        ("september", "09"),
-        ("oktober", "10"),
-        ("november", "11"),
-        ("desember", "12"),
-    ]);
-
-    for ul in document.select(&ul_selector) {
-        let year_str = year.to_string();
-
-        let month_str = ul
-            .select(&Selector::parse("li a").unwrap())
-            .next()
-            .map(|e| e.text().collect::<String>())
-            .unwrap_or_default();
-
-        let month = month_str
-            .to_lowercase()
-            .replace(char::is_numeric, "")
-            .trim()
-            .to_string();
-        let month_code = month_map.get(month.as_str()).unwrap_or(&"");
-
-        let tr_selector = Selector::parse("li:nth-child(4) tbody tr").unwrap();
-        for tr in ul.select(&tr_selector) {
-            let day = tr
-                .select(&Selector::parse("td:first-child").unwrap())
-                .next()
-                .map(|e| e.text().collect::<String>())
-                .unwrap_or_default();
-
-            let description = tr
-                .select(&Selector::parse("td:nth-child(2)").unwrap())
-                .next()
-                .map(|e| e.text().collect::<String>())
-                .unwrap_or_default();
-
-            let full_date = format!("{}-{}-{}", year_str, month_code, day);
-
-            data.push(HariLibur {
-                tanggal: full_date,
-                keterangan: description,
-            });
-        }
-    }
-
-    fs::create_dir_all("data")?;
-    let filename = format!("data/{}.json", year);
-    let json_data = serde_json::to_string_pretty(&data)?;
-    fs::write(&filename, json_data)?;
-
-    println!("File {} successfully created", filename);
-
-    let holidays: Vec<Holiday> = data
-        .into_iter()
-        .map(|h| Holiday {
-            date: h.tanggal,
-            description: h.keterangan.clone(),
-            is_joint_leave: h.keterangan.contains("Cuti Bersama"),
-        })
-        .collect();
-
-    Ok(holidays)
+    Ok(())
 }
